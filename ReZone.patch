@@ -1,0 +1,1374 @@
+From 8539366cb14de01a1e0cbc93f29d4bc41e408dd3 Mon Sep 17 00:00:00 2001
+From: ab <1@qq.com>
+Date: Fri, 6 Feb 2026 14:23:05 +0800
+Subject: [PATCH] ReZone: avoid migrating unaffected blocks
+
+This patch avoids migrating blocks that are not affected by
+read disturb, reducing write amplification while maintaining
+similar response latency.
+
+Signed-off-by: ab <1@qq.com>
+---
+ hw/femu/femu.c      |  10 +-
+ hw/femu/nand/nand.h |   2 +-
+ hw/femu/nvme.h      |   4 +
+ hw/femu/zns/zftl.c  | 805 +++++++++++++++++++++++++++++++++++++++++---
+ hw/femu/zns/zftl.h  |   4 +
+ hw/femu/zns/zns.c   | 103 +++++-
+ hw/femu/zns/zns.h   |  64 +++-
+ 7 files changed, 916 insertions(+), 76 deletions(-)
+
+diff --git a/hw/femu/femu.c b/hw/femu/femu.c
+index 82a1b675..f866c79d 100644
+--- a/hw/femu/femu.c
++++ b/hw/femu/femu.c
+@@ -664,11 +664,17 @@ static const Property femu_props[] = {
+     DEFINE_PROP_UINT8("lnum_lun", FemuCtrl, oc_params.num_lun, 8),
+     DEFINE_PROP_UINT8("lnum_pln", FemuCtrl, oc_params.num_pln, 2),
+     DEFINE_PROP_UINT16("lmetasize", FemuCtrl, oc_params.sos, 16),
+-    DEFINE_PROP_UINT8("zns_num_ch", FemuCtrl, zns_params.zns_num_ch, 2),
++    DEFINE_PROP_UINT8("zns_num_ch", FemuCtrl, zns_params.zns_num_ch, 8),
+     DEFINE_PROP_UINT8("zns_num_lun", FemuCtrl, zns_params.zns_num_lun, 4),
+     DEFINE_PROP_UINT8("zns_num_plane", FemuCtrl, zns_params.zns_num_plane, 2),
+-    DEFINE_PROP_UINT8("zns_num_blk", FemuCtrl, zns_params.zns_num_blk, 32),
++    DEFINE_PROP_UINT8("zns_num_blk", FemuCtrl, zns_params.zns_num_blk, 64),
+     DEFINE_PROP_INT32("zns_flash_type", FemuCtrl, zns_params.zns_flash_type, QLC),
++
++    DEFINE_PROP_BOOL("read_refresh_enabled", FemuCtrl, zns_params.read_refresh_enabled, false),
++    DEFINE_PROP_UINT32("read_refresh_threshold", FemuCtrl, zns_params.read_refresh_threshold, 1024),
++    DEFINE_PROP_UINT32("migration", FemuCtrl, zns_params.migration, 1),
++
++
+     DEFINE_PROP_INT32("secsz", FemuCtrl, bb_params.secsz, 512),
+     DEFINE_PROP_INT32("secs_per_pg", FemuCtrl, bb_params.secs_per_pg, 8),
+     DEFINE_PROP_INT32("pgs_per_blk", FemuCtrl, bb_params.pgs_per_blk, 256),
+diff --git a/hw/femu/nand/nand.h b/hw/femu/nand/nand.h
+index 91efd929..f52ae8a4 100644
+--- a/hw/femu/nand/nand.h
++++ b/hw/femu/nand/nand.h
+@@ -62,7 +62,7 @@
+ #define QLC_UPPER_PAGE_WRITE_LATENCY_NS         (TLC_UPPER_PAGE_WRITE_LATENCY_NS * 1.6)
+ 
+ #define QLC_CHNL_PAGE_TRANSFER_LATENCY_NS	    (52433)
+-#define QLC_BLOCK_ERASE_LATENCY_NS              (3000000)
++#define QLC_BLOCK_ERASE_LATENCY_NS              (2000000)
+ 
+ enum {
+     SLC_PAGE              = 0,
+diff --git a/hw/femu/nvme.h b/hw/femu/nvme.h
+index dc7c51bd..7bb0c876 100644
+--- a/hw/femu/nvme.h
++++ b/hw/femu/nvme.h
+@@ -1177,6 +1177,10 @@ typedef struct ZNSCtrlParams {
+     uint8_t  zns_num_plane;
+     uint8_t  zns_num_blk;
+     int zns_flash_type;
++
++    bool read_refresh_enabled;
++    uint32_t read_refresh_threshold;
++    uint32_t migration;
+ } ZNSCtrlParams;
+ 
+ typedef struct OcCtrlParams {
+diff --git a/hw/femu/zns/zftl.c b/hw/femu/zns/zftl.c
+index 2a4f932d..f364e6e4 100644
+--- a/hw/femu/zns/zftl.c
++++ b/hw/femu/zns/zftl.c
+@@ -3,6 +3,313 @@
+ //#define FEMU_DEBUG_ZFTL
+ 
+ static void *ftl_thread(void *arg);
++static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t stime);
++
++static int num(struct zns_ssd *zns, int ch,int lun,int plane){
++    return ch*zns->num_lun*zns->num_plane + lun * zns->num_plane + plane;
++}
++
++// int find_Lcurve_knee(double RR_reduce[], double Migration[], int n) {
++//     if (n < 3) return -1;  // 至少需要 3 点
++
++//     Point* pts = (Point*)malloc(sizeof(Point) * n);
++
++//     double max_rr_reduce = RR_reduce[0];
++//     for(int j = 0;j < n; j++){
++//         if(RR_reduce [j] > max_rr_reduce){
++//             max_rr_reduce = RR_reduce[j];
++//         }
++//     }
++    
++//     // 1. 计算 u = log(RR_reduce), v = log(Migration)
++//     for (int i = 0; i < n; i++) {
++//         pts[i].u = RR_reduce[i]/max_rr_reduce;
++//         pts[i].v = Migration[i]/(n-1);
++//     }
++
++//     // // 3. 计算每个中间点的离散曲率
++//     // double max_curv = -1.0;
++//     // int knee_index = -1;
++
++//     // 2. 动态分配内存以存储每个点的有向角
++//     // 角度 theta_i 是为点 pts[i] 计算的, i 的范围从 1 到 n-2
++//     // 所以总共有 n-2 个角度
++//     int num_thetas = n - 2;
++//     double* thetas = (double*)malloc(num_thetas * sizeof(double));
++//     if (thetas == NULL) {
++//         // 内存分配失败，返回一个错误代码或最保守的选择
++//         if (pts) free(pts);
++//         return 1; 
++//     }
++
++//     for (int i = 1; i < n - 1; i++) {
++//         double ax = pts[i].u   - pts[i-1].u;
++//         double ay = pts[i].v   - pts[i-1].v;
++//         double bx = pts[i+1].u - pts[i].u;
++//         double by = pts[i+1].v - pts[i].v;
++
++//         double dot = ax * bx + ay * by;
++//         double na = sqrt(ax*ax + ay*ay);
++//         double nb = sqrt(bx*bx + by*by);
++
++//         if (na == 0 || nb == 0) continue;
++
++//         // 夹角 theta
++//         double cos_theta = dot / (na * nb);
++//         if (cos_theta > 1) cos_theta = 1;
++//         if (cos_theta < -1) cos_theta = -1;
++
++//         double theta = acos(cos_theta);
++//         double curvature = theta;   // 越大越弯
++
++//         // 保存最大曲率点
++//         if (curvature > max_curv) {
++//             max_curv = curvature;
++//             knee_index = i;
++//         }
++//     }
++
++//     free(pts);
++//     return knee_index;
++// }
++
++
++int find_Lcurve_knee(double RR_reduce[], double Migration[], int n) {
++    if (n < 3) return 0;
++
++    typedef struct { double u, v; } Point;
++    Point* pts = (Point*)malloc(sizeof(Point) * n);
++    
++    // 1. 归一化 (u = Migration, v = RR_reduce)
++    double max_v = RR_reduce[0];
++    for(int j = 0; j < n; j++) if(RR_reduce[j] > max_v) max_v = RR_reduce[j];
++    double denom_v = (max_v > 0) ? max_v : 1.0;
++
++    for (int i = 0; i < n; i++) {
++        pts[i].u = Migration[i] / (double)(pow(2,n - 1)); // x轴
++        pts[i].v = RR_reduce[i] / denom_v;          // y轴
++    }
++
++    int num_thetas = n - 2;
++    double* thetas = (double*)malloc(num_thetas * sizeof(double));
++    bool has_positive = false;
++    bool has_negative = false;
++
++    // 2. 计算从向量 b 到向量 a 的角度
++    for (int i = 0; i < num_thetas; i++) {
++        int idx = i + 1; // 当前中间点 Xi
++        // a = Xi - Xi-1
++        double ax = pts[idx].u - pts[idx - 1].u;
++        double ay = pts[idx].v - pts[idx - 1].v;
++        // b = Xi+1 - Xi
++        double bx = pts[idx + 1].u - pts[idx].u;
++        double by = pts[idx + 1].v - pts[idx].v;
++
++        // 角度定义从 b 到 a: atan2(det(b, a), dot(b, a))
++        // det(b, a) = bx * ay - by * ax
++        double det = bx * ay - by * ax;
++        double dot = bx * ax + by * ay;
++        thetas[i] = atan2(det, dot);
++        
++        if (thetas[i] > 1e-9) has_positive = true;
++        if (thetas[i] < -1e-9) has_negative = true;
++    }
++
++    int optimal_index = -1;
++
++    // 3. 决策逻辑 (从后往前扫描)
++    if (!has_positive) { 
++        // 全负：下降平缓，最大化粒度
++        optimal_index = n - 1; 
++    } else if (!has_negative) {
++        // 全正：下降很快，最小化粒度以规避风险
++        optimal_index = 1;
++    } else {
++        for (int i = num_thetas - 1; i > 0; i--) {
++            // 从右向左找：[i]是右边的角，[i-1]是左边的角
++            // 先正（右侧风险）后负（左侧安全）
++            if (thetas[i] > 0 && thetas[i - 1] <= 0) {
++                optimal_index = i; // 选择由风险进入安全的转折点
++                break;
++            }
++            // 先负后正
++            if (thetas[i] <= 0 && thetas[i - 1] > 0) {
++                optimal_index = n - 1;
++                break;
++            }
++        }
++    }
++
++    if (optimal_index == -1) optimal_index = n - 1;
++
++    free(thetas);
++    free(pts);
++    return optimal_index;
++}
++
++FILE *open_output_file(const char *filename) {
++    FILE *fp = fopen(filename, "a");  // "a" = 追加写
++    if (!fp) {
++        perror("fopen");
++    }
++    return fp;
++}
++
++
++void dump_intermediate_data(FILE *fp, int step, double value) {
++    if (fp) {
++        fprintf(fp, "Step %d: Value = %.6f\n", step, value);
++    } else {
++        fprintf(stderr, "Error: invalid file pointer\n");
++    }
++}
++
++// 关闭文件
++void close_output_file(FILE *fp) {
++    if (fp) {
++        fclose(fp);
++    }
++}
++
++static get_ch_num(struct zns_ssd *zns,int num){
++    return num/(zns->num_lun*zns->num_plane);
++}
++
++static get_lun_num(struct zns_ssd *zns,int num){
++    int shift = num%(zns->num_lun*zns->num_plane);
++    return shift/zns->num_plane;
++}
++
++static get_plane_num(struct zns_ssd *zns,int num){
++    return num%zns->num_plane;
++}
++
++
++int find_migration(struct zns_ssd *zns,struct ppa ppa,int zid){
++    int temp_migration = 0;
++    double number_less = 0.0;
++    double total_reduce = 0;
++    int total_paralleism = zns->num_ch * zns->num_lun *zns->num_plane;
++
++    double* RR = malloc(sizeof(double) * total_paralleism);
++    for (int q = 0; q < zns->num_ch; q++)
++    {
++        for (int  w = 0; w < zns->num_lun; w++)
++        {
++            for (int e = 0; e < zns->num_plane; e++)
++            {
++                int numb = num(zns,q,w,e);
++                int temp_readcount = zns->ch[q].fc[w].plane[e].blk[zns->pz[zid].zb[numb].number].read_count;
++
++
++                int k = temp_readcount * 8 / zns->read_refresh_threshold;
++                if (k > 8) k = 8;
++                double result = k / 8.0;
++
++                number_less += result;
++
++                // femu_log("number_less  is %d\n",number_less);
++
++                RR[numb] = (1-result);
++                // femu_log("temp read is %d\n",temp_readcount);
++
++                // femu_log("RR is %f\n",RR[numb]);
++                total_reduce += RR[numb];
++            }
++            
++        }
++
++    }
++
++    if(number_less < (total_paralleism / 8)){
++        temp_migration = 1;
++    }else{
++        int point = log2( zns->num_ch * zns->num_lun *zns->num_plane);
++        
++        double* RR_Reduce = malloc(sizeof(double) * (point+1));
++        double* RR_Migration = malloc(sizeof(double) * (point+1));
++
++        // femu_log("point is %d\n",point);
++
++        for(int m = 0; m <= point; m++){
++            RR_Migration[m] = pow(2,m);
++
++            // femu_log("RR_Migration is %f\n",RR_Migration[m]);
++
++            double more_rr = 0;
++            int start_rr_num = num(zns,ppa.g.ch,ppa.g.fc,ppa.g.pl)-(num(zns,ppa.g.ch,ppa.g.fc,ppa.g.pl)%((int)pow(2,m)));
++            for(int RR_round = 0; RR_round<((int)pow(2,m)); RR_round++){
++                more_rr += RR[start_rr_num + RR_round];
++            }
++            // double temp = total_reduce - more_rr;
++
++            // femu_log("RR_Migration is %f\n",RR_Migration[m]);
++            // femu_log("RR_Reduce is %f\n",temp);
++
++            RR_Reduce[m] = total_reduce - more_rr;
++            // if(temp <= 1.0) temp = 1.0;
++            // RR_Reduce[m] = log2(temp);
++            // femu_log("RR_Reduce is %f\n",RR_Reduce[m]);
++
++        }
++
++        int knee_index = find_Lcurve_knee(RR_Reduce,RR_Migration,point+1);
++        // zns->pz[blk->det_zone].migration_intensity = (int)(RR_Migration[knee_index]);
++        temp_migration = (int)(RR_Migration[knee_index]);
++        free(RR);
++        free(RR_Migration);
++        free(RR_Reduce);
++    }
++    return temp_migration;
++    // FILE *fp = open_output_file("RR_migration_intensity.txt");
++    // if (fp) {
++    //     fprintf(fp, "migration_intensity is  %d\n", temp_migration);
++    // }
++    // close_output_file(fp); 
++}
++
++
++void check_zone_is_all_migration(struct zns_ssd *zns, int zid){
++
++    bool is_all_migration = true;
++    for (int q = 0; q < zns->num_ch; q++)
++    {
++        for (int  w = 0; w < zns->num_lun; w++)
++        {
++            for (int e = 0; e < zns->num_plane; e++)
++            {
++                int numb = num(zns,q,w,e);
++                if(!zns->ch[q].fc[w].plane[e].blk[zns->pz[zid].zb[numb].number].is_migration){
++                    is_all_migration = false;
++                    break;
++                }
++            }
++            
++        }
++
++    }
++
++    if(is_all_migration){
++        for (int q = 0; q < zns->num_ch; q++)
++        {
++            for (int  w = 0; w < zns->num_lun; w++)
++            {
++                for (int e = 0; e < zns->num_plane; e++)
++                {
++                    int numb = num(zns,q,w,e);
++                    zns->ch[q].fc[w].plane[e].blk[zns->pz[zid].zb[numb].number].is_migration = false;
++                }
++                
++            }
++
++        } 
++        zns->pz[zid].migration_intensity = 0;
++    }
++
++
++}
++
++
+ 
+ static inline struct ppa get_maptbl_ent(struct zns_ssd *zns, uint64_t lpn)
+ {
+@@ -51,19 +358,28 @@ static inline void check_addr(int a, int max)
+    assert(a >= 0 && a < max);
+ }
+ 
+-static void zns_advance_write_pointer(struct zns_ssd *zns)
++static void zns_advance_write_pointer(struct zns_ssd *zns,int wcidx)
+ {
+-    struct write_pointer *wpp = &zns->wp;
++    struct write_pointer *wpp = &(zns->wp[zns->cache.write_cache[wcidx].sblk]);
+ 
+     check_addr(wpp->ch, zns->num_ch);
+     wpp->ch++;
++    // femu_log("channel num is %d\n",wpp->ch);
+     if (wpp->ch == zns->num_ch) {
+         wpp->ch = 0;
+         check_addr(wpp->lun, zns->num_lun);
+         wpp->lun++;
+-        /* in this case, we should go to next lun */
++        // femu_log("chip num is %d\n",wpp->lun);
++
+         if (wpp->lun == zns->num_lun) {
+             wpp->lun = 0;
++            check_addr(wpp->pl, zns->num_plane);
++            wpp->pl++;
++            //Misao: new loop
++            if(wpp->pl == zns->num_plane)
++            {
++                wpp->pl = 0;
++            }
+         }
+     }
+ }
+@@ -126,7 +442,7 @@ static inline bool valid_ppa(struct zns_ssd *zns, struct ppa *ppa)
+     int sub_pg = ppa->g.spg;
+ 
+     if (ch >= 0 && ch < zns->num_ch && lun >= 0 && lun < zns->num_lun && pl >=
+-        0 && pl < zns->num_plane && blk >= 0 && blk < zns->num_blk && pg>=0 && pg < zns->num_page && sub_pg >= 0 && sub_pg < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE)
++        0 && pl < zns->num_plane && blk >= 0 && blk < zns->num_blk && pg>=0 && pg < zns->num_page*ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE && sub_pg >= 0 && sub_pg < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE)
+         return true;
+ 
+     return false;
+@@ -137,23 +453,47 @@ static inline bool mapped_ppa(struct ppa *ppa)
+     return !(ppa->ppa == UNMAPPED_PPA);
+ }
+ 
+-static struct ppa get_new_page(struct zns_ssd *zns)
++
++
++
++static struct ppa get_new_page(struct zns_ssd *zns,int wcidx)
+ {
+-    struct write_pointer *wpp = &zns->wp;
++    struct write_pointer *wpp = &(zns->wp[zns->cache.write_cache[wcidx].sblk]);
+     struct ppa ppa;
+     ppa.ppa = 0;
+     ppa.g.ch = wpp->ch;
+     ppa.g.fc = wpp->lun;
+-    ppa.g.blk = zns->active_zone;
++    ppa.g.pl = wpp->pl;
++    ppa.g.blk = zns->pz[zns->cache.write_cache[wcidx].sblk].zb[num(zns,wpp->ch,wpp->lun,wpp->pl)].number;
+     ppa.g.V = 1; //not padding page
+-    if(!valid_ppa(zns,&ppa))
++    // if(!valid_ppa(zns,&ppa))
++    // {
++    //     ftl_err("[Misao] invalid ppa---: ch %u lun %u pl %u blk %u pg %u subpg  %u \n",ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg);
++    //     ppa.ppa = UNMAPPED_PPA;
++    // }
++    return ppa;
++}
++
++
++static int get_new_block_read_refresh(struct zns_ssd *zns,struct ppa *old_ppa){
++    struct zns_blk *blk = get_blk(zns, old_ppa);
++    int m = 0;
++    for (m = 0; m < zns->num_blk; m++)
+     {
+-        ftl_err("[Misao] invalid ppa: ch %u lun %u pl %u blk %u pg %u subpg  %u \n",ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg);
+-        ppa.ppa = UNMAPPED_PPA;
++        if(!zns->ch[old_ppa->g.ch].fc[old_ppa->g.fc].plane[old_ppa->g.pl].blk[m].is_use){
++            zns->pz[blk->det_zone].zb[num(zns,old_ppa->g.ch,old_ppa->g.fc,old_ppa->g.pl)].number = m;
++            zns->ch[old_ppa->g.ch].fc[old_ppa->g.fc].plane[old_ppa->g.pl].blk[m].is_use = true;
++            zns->ch[old_ppa->g.ch].fc[old_ppa->g.fc].plane[old_ppa->g.pl].blk[m].det_zone = blk->det_zone;
++            break;
++        }
+     }
+-    return ppa;
++    if(m>=zns->num_blk){
++        ftl_err("can't find rr block----------\n");
++    }
++    return m;
+ }
+ 
++
+ static int zns_get_wcidx(struct zns_ssd* zns)
+ {
+     int i;
+@@ -167,6 +507,181 @@ static int zns_get_wcidx(struct zns_ssd* zns)
+     return -1;
+ }
+ 
++static void zns_queue_full_block_refresh(struct zns_ssd *zns, struct ppa *ppa,uint64_t s_stime)
++{
++        //femu_log("start full block refresh first---------------------\n");
++    struct zns_refresh_queue *queue = &zns->refresh_queue;
++    struct zns_refresh_req *req;
++    
++
++    if (queue->pending_count >= queue->max_pending) {
++        femu_log("[RR] Refresh queue full, dropping full block refresh for block %u\n", ppa->g.blk);
++        return;
++    }
++    
++    req = g_malloc0(sizeof(struct zns_refresh_req));
++
++
++    req->old_ppa.g.ch = ppa->g.ch;
++    req->old_ppa.g.fc = ppa->g.fc;
++    req->old_ppa.g.pl = ppa->g.pl;
++    req->old_ppa.g.blk = ppa->g.blk;
++
++    req->old_ppa.g.pg = 0;  /* Start from page 0 */
++    req->old_ppa.g.spg = 0;
++
++    req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    // req->stime = s_stime;
++
++    req->is_full_block_refresh = true;
++    req->lpn = INVALID_LPN;  /* Invalid for full block refresh */
++    
++    /* For ZNS sequential write, we don't pre-allocate a specific block */
++    /* Instead, we'll use the current write pointer and advance it sequentially */
++    req->new_ppa.ppa = UNMAPPED_PPA;  /* Will be determined during processing */
++
++    
++    QTAILQ_INSERT_TAIL(&queue->pending_reqs, req, entry);
++    queue->pending_count++;
++}
++
++static void zns_refresh_full_block_ppa(struct zns_ssd *zns, struct ppa *ppa){
++    uint64_t lpn;
++    struct zns_blk *old_blk = get_blk(zns, ppa);
++    struct nand_cmd read_cmd;
++    uint64_t read_lat = 0;
++    struct nand_cmd write_cmd;
++    write_cmd.stime = 0;
++    uint64_t write_lat = 0;
++    struct zns_blk *blk; 
++
++    struct ppa new_ppa;
++
++    // femu_log("zns refresh move start .........\n");
++
++    // femu_log("old block lpn_wp is %d\n",old_blk->lpn_wp);
++
++    int new_block = get_new_block_read_refresh(zns,ppa);
++    int i = 0;
++    while (i < old_blk->lpn_wp) 
++    {    
++        lpn = old_blk->lpn_list[i].lpn;
++        struct  ppa old_ppa = get_maptbl_ent(zns,lpn);
++        
++        new_ppa.ppa = 0;
++        new_ppa.g.ch = old_ppa.g.ch;
++        new_ppa.g.fc = old_ppa.g.fc;
++        new_ppa.g.pl = old_ppa.g.pl;
++        new_ppa.g.blk = new_block;
++        new_ppa.g.V = 1; //not padding page
++
++        for(int j = 0; j < zns->flash_type; j++){
++            new_ppa.g.pg = old_ppa.g.pg;
++
++            for(int subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
++            {
++                if(i+subpage >= old_blk->lpn_wp)
++                {
++                    //No need to write an invalid page
++                    break;
++                }
++                lpn = old_blk->lpn_list[i+subpage].lpn;
++
++                blk = get_blk(zns,&new_ppa);
++                blk->lpn_list[blk->lpn_wp].lpn = lpn;
++                blk->lpn_wp++;
++
++                old_ppa = get_maptbl_ent(zns, lpn);
++                new_ppa.g.spg = old_ppa.g.spg;
++
++                
++
++                if(old_ppa.ppa == UNMAPPED_PPA){
++                    break;
++                }
++
++                read_cmd.type = GC_IO;
++                read_cmd.cmd = NAND_READ;
++                read_cmd.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++                read_lat = zns_advance_status(zns, &old_ppa, &read_cmd);
++
++                set_maptbl_ent(zns,lpn,&new_ppa);
++            }
++            i+=ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;
++            lpn = old_blk->lpn_list[i].lpn;
++            old_ppa = get_maptbl_ent(zns, lpn);
++        }
++        if(new_ppa.g.V)
++        {
++            write_cmd.type = GC_IO;
++            write_cmd.cmd = NAND_WRITE;
++            write_cmd.stime = read_cmd.stime + read_lat;
++            write_lat = zns_advance_status(zns, &new_ppa, &write_cmd);
++        }
++    }
++
++
++    struct nand_cmd erase_cmd;
++    erase_cmd.type = GC_IO;
++    erase_cmd.cmd = NAND_ERASE;
++    erase_cmd.stime = write_cmd.stime + write_lat;
++    uint64_t erase_lat = zns_advance_status(zns, ppa, &erase_cmd);
++
++
++    // femu_log("[RR] finish...\n");
++    /* Reset read count for the old block (now empty) */
++
++    blk->is_migration = true;
++
++    old_blk->page_wp = 0;
++    old_blk->is_use = false;
++    old_blk->read_count = 0;
++    old_blk->refresh_pending = false;
++    old_blk->lpn_wp = 0;
++    old_blk->det_zone = 0;
++    
++    // g_free(lpn_list);
++    FILE *fp = open_output_file("RR_count.txt");
++    RR_start_count++;
++    if (fp) {
++        fprintf(fp, "RR count is  %d\n", RR_start_count);
++    }
++    close_output_file(fp); 
++}
++
++
++
++static void zns_process_refresh_requests(struct zns_ssd *zns)
++{
++    struct zns_refresh_queue *queue = &zns->refresh_queue;
++    struct zns_refresh_req *req, *next;
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    
++    QTAILQ_FOREACH_SAFE(req, &queue->pending_reqs, entry, next) {
++        /* Process one refresh request per call to avoid blocking */
++        // if (now - req->stime < 1000000) { /* 1ms delay */
++        //     continue;
++        // }
++        
++        if (req->is_full_block_refresh) {
++            /* Handle ZNS sequential block refresh */
++            // femu_log("[RR] Processing ZNS sequential refresh: block %u -> sequential write\n",
++            //         req->old_ppa.g.blk);
++            
++            // zns_refresh_full_block(zns, req->old_ppa.g.blk);
++
++            zns_refresh_full_block_ppa(zns, &req->old_ppa);
++
++        } 
++        QTAILQ_REMOVE(&queue->pending_reqs, req, entry);
++        queue->pending_count--;
++        g_free(req);
++        
++        // femu_log("[RR] Refresh completed for LPN %lu\n", req->lpn);
++        break; /* Process only one request per call */
++    }
++}
++
+ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
+ {
+     uint64_t lba = req->slba;
+@@ -178,11 +693,86 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
+     struct ppa ppa;
+     uint64_t lpn;
+     uint64_t sublat, maxlat = 0;
+-
+     /* normal IO read path */
+     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+         ppa = get_maptbl_ent(zns, lpn);
+-        if (!mapped_ppa(&ppa) || !valid_ppa(zns, &ppa)) {
++
++        if(zns->read_refresh_enabled){
++            if(ppa.ppa != UNMAPPED_PPA){
++                struct zns_blk *blk = get_blk(zns,&ppa);
++                blk->read_count++;
++                //femu_log("read ch is %d, chip is %d\n",ppa.g.ch,ppa.g.fc);
++                if(!zns->pz[blk->det_zone].is_do_RR){
++                    if(blk->read_count >= zns->read_refresh_threshold && !blk->refresh_pending){
++
++                        for(int i = 0;i < zns->cache.num_wc;i++)
++                        {
++                            if(zns->cache.write_cache[i].sblk==blk->det_zone)
++                            {
++                                zns_wc_flush(zns,i,USER_IO,req->stime); 
++                                break;
++                            }
++                        }
++
++                        int temp_migration = 64;
++
++                        if(zns->pz[blk->det_zone].migration_intensity == 0){
++                            temp_migration = find_migration(zns,ppa,blk->det_zone);
++
++                            zns->pz[blk->det_zone].migration_intensity = temp_migration;
++
++                            FILE *fp = open_output_file("RR_migration_intensity.txt");
++                            if (fp) {
++                                fprintf(fp, "migration_intensity is  %d\n", temp_migration);
++                            }
++                            close_output_file(fp); 
++                        }else{
++                            if(blk->is_migration){
++                                temp_migration = find_migration(zns,ppa,blk->det_zone);
++                                zns->pz[blk->det_zone].migration_intensity = temp_migration;
++
++                                FILE *fp = open_output_file("RR_migration_intensity.txt");
++                                if (fp) {
++                                    fprintf(fp, "migration_intensity is  %d\n", temp_migration);
++                                }
++                                close_output_file(fp); 
++                            }else{
++                                temp_migration = zns->pz[blk->det_zone].migration_intensity;
++                            }
++                        }
++                        // femu_log("migration is %d\n",temp_migration);
++                        int start_num = num(zns,ppa.g.ch,ppa.g.fc,ppa.g.pl)-(num(zns,ppa.g.ch,ppa.g.fc,ppa.g.pl) % temp_migration);
++
++                        for(int round=0; round < temp_migration; round++){
++
++                            struct ppa temp_ppa;
++                            temp_ppa.ppa = 0;
++                            temp_ppa.g.ch=get_ch_num(zns,start_num+round);
++                            temp_ppa.g.fc=get_lun_num(zns,start_num+round);
++                            temp_ppa.g.pl=get_plane_num(zns,start_num+round);
++                            temp_ppa.g.blk=zns->pz[blk->det_zone].zb[start_num+round].number;
++
++                            struct zns_blk *temp_blk = get_blk(zns,&temp_ppa);
++                            temp_blk->refresh_pending = true;
++                        
++                            /* Queue full block refresh request for background processing */
++                            zns_queue_full_block_refresh(zns, &temp_ppa,req->stime);
++                            zns_process_refresh_requests(zns);
++                        }
++
++                        check_zone_is_all_migration(zns,blk->det_zone);
++                        //zns_process_refresh_requests(zns);
++                        // blk->refresh_pending = true;
++                        // zns->pz[blk->det_zone].is_do_RR = true;
++                        // zns->pz[blk->det_zone].migration_intensity = 0;
++                    }
++                    
++
++                }
++            }
++        }
++        
++        if (!mapped_ppa(&ppa)) {
+             continue;
+         }
+ 
+@@ -192,7 +782,6 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
+         srd.stime = req->stime;
+ 
+         sublat = zns_advance_status(zns, &ppa, &srd);
+-        femu_log("[R] lpn:\t%lu\t<--ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
+         maxlat = (sublat > maxlat) ? sublat : maxlat;
+     }
+ 
+@@ -201,62 +790,108 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
+ 
+ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t stime)
+ {
+-    int i,j,p,subpage;
++    int i,j,subpage;
+     struct ppa ppa;
+     struct ppa oldppa;
+     uint64_t lpn;
+     int flash_type = zns->flash_type;
+     uint64_t sublat = 0, maxlat = 0;
++    struct zns_blk *blk; 
+ 
+     i = 0;
+     while(i < zns->cache.write_cache[wcidx].used)
+     {
+-        for(p = 0;p<zns->num_plane;p++){
+-            /* new write */
+-            ppa = get_new_page(zns);
+-            ppa.g.pl = p;
+-            for(j = 0; j < flash_type ;j++)
++        
++        /* new write */
++        ppa = get_new_page(zns,wcidx);
++        for(j = 0; j < flash_type; j++){
++            ppa.g.pg = get_blk(zns,&ppa)->page_wp;
++            get_blk(zns,&ppa)->page_wp++;
++            for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
+             {
+-                ppa.g.pg = get_blk(zns,&ppa)->page_wp;
+-                get_blk(zns,&ppa)->page_wp++;
+-                for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
++                if(i+subpage >= zns->cache.write_cache[wcidx].used)
+                 {
+-                    if(i+subpage >= zns->cache.write_cache[wcidx].used)
+-                    {
+-                        //No need to write an invalid page
+-                        break;
+-                    }
+-                    lpn = zns->cache.write_cache[wcidx].lpns[i+subpage];
+-                    oldppa = get_maptbl_ent(zns, lpn);
+-                    if (mapped_ppa(&oldppa)) {
+-                        /* FIXME: Misao: update old page information*/
+-                    }
+-                    ppa.g.spg = subpage;
+-                    /* update maptbl */
+-                    set_maptbl_ent(zns, lpn, &ppa);
+-                    //femu_log("[F] lpn:\t%lu\t-->ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
++                    //No need to write an invalid page
++                    break;
+                 }
+-                i+=ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;
+-            }
+-            //FIXME Misao: identify padding page
+-            if(ppa.g.V)
+-            {
+-                struct nand_cmd swr;
+-                swr.type = type;
+-                swr.cmd = NAND_WRITE;
+-                swr.stime = stime;
+-                /* get latency statistics */
+-                sublat = zns_advance_status(zns, &ppa, &swr);
+-                maxlat = (sublat > maxlat) ? sublat : maxlat;
++                lpn = zns->cache.write_cache[wcidx].lpns[i+subpage];
++
++
++                blk = get_blk(zns,&ppa);
++                blk->lpn_list[blk->lpn_wp].lpn = lpn;
++                blk->lpn_wp++;
++            
++                oldppa = get_maptbl_ent(zns, lpn);
++                if (mapped_ppa(&oldppa)) {
++                    /* FIXME: Misao: update old page information*/
++                }
++                ppa.g.spg = subpage;
++                /* update maptbl */
++                set_maptbl_ent(zns, lpn, &ppa);
++                //femu_log("[F] lpn:\t%lu\t-->ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
+             }
++            i+=ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;
++        }
++        //FIXME Misao: identify padding page
++        if(ppa.g.V)
++        {
++            struct nand_cmd swr;
++            swr.type = type;
++            swr.cmd = NAND_WRITE;
++            swr.stime = stime;
++            /* get latency statistics */
++            sublat = zns_advance_status(zns, &ppa, &swr);
++            maxlat = (sublat > maxlat) ? sublat : maxlat;
+         }
++        
+         /* need to advance the write pointer here */
+-        zns_advance_write_pointer(zns);
++        zns_advance_write_pointer(zns,wcidx);
+     }
+     zns->cache.write_cache[wcidx].used = 0;
+     return maxlat;
+ }
+ 
++
++static void construct_zone(struct zns_ssd *zns ,int wcidx){
++    if(zns->pz[zns->cache.write_cache[wcidx].sblk].is_ter){
++        return ;
++    }
++
++    for (int i = 0; i < zns->num_ch; i++)
++    {
++        for (int  j = 0; j < zns->num_lun; j++)
++        {
++            for (int k = 0; k < zns->num_plane; k++)
++            {
++                if(zns->ch[i].fc[j].plane[k].blk[zns->cache.write_cache[wcidx].sblk].is_use){
++                    for (int m = 0; m < zns->num_blk; m++)
++                    {
++                        if(!zns->ch[i].fc[j].plane[k].blk[m].is_use){
++                            zns->pz[zns->cache.write_cache[wcidx].sblk].zb[num(zns,i,j,k)].number = m;
++                            zns->ch[i].fc[j].plane[k].blk[m].is_use = true;
++                            zns->ch[i].fc[j].plane[k].blk[m].det_zone = zns->cache.write_cache[wcidx].sblk;
++                            break;
++                        }
++                    }
++                    
++
++                }else{
++                    zns->pz[zns->cache.write_cache[wcidx].sblk].zb[num(zns,i,j,k)].number = zns->cache.write_cache[wcidx].sblk;
++                    zns->ch[i].fc[j].plane[k].blk[zns->cache.write_cache[wcidx].sblk].is_use = true;
++                    zns->ch[i].fc[j].plane[k].blk[zns->cache.write_cache[wcidx].sblk].det_zone = zns->cache.write_cache[wcidx].sblk;
++                }
++
++            }
++            
++        }
++
++    }
++    zns->pz[zns->cache.write_cache[wcidx].sblk].is_ter = true;
++    return;
++}
++
++
++
+ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
+ {
+     uint64_t lba = req->slba;
+@@ -292,23 +927,83 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
+         zns->cache.write_cache[wcidx].sblk = zns->active_zone;
+     }
+ 
++
++    construct_zone(zns,wcidx);
++
+     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+         if(zns->cache.write_cache[wcidx].used==zns->cache.write_cache[wcidx].cap)
+         {
+-            femu_log("[W] flush wc %d (%u/%u)\n",wcidx,(int)zns->cache.write_cache[wcidx].used,(int)zns->cache.write_cache[wcidx].cap);
++            //femu_log("[W] flush wc %d (%u/%u)\n",wcidx,(int)zns->cache.write_cache[wcidx].used,(int)zns->cache.write_cache[wcidx].cap);
+             sublat = zns_wc_flush(zns,wcidx,USER_IO,req->stime);
+-            femu_log("[W] flush lat: %u\n", (int)sublat);
++            //femu_log("[W] flush lat: %u\n", (int)sublat);
+             maxlat = (sublat > maxlat) ? sublat : maxlat;
+             sublat = 0;
+         }
+         zns->cache.write_cache[wcidx].lpns[zns->cache.write_cache[wcidx].used++]=lpn;
+         sublat += SRAM_WRITE_LATENCY_NS; //Simplified timing emulation
+         maxlat = (sublat > maxlat) ? sublat : maxlat;
+-        femu_log("[W] lpn:\t%lu\t-->wc cache:%u, used:%u\n",lpn,(int)wcidx,(int)zns->cache.write_cache[wcidx].used);
++        //femu_log("[W] lpn:\t%lu\t-->wc cache:%u, used:%u\n",lpn,(int)wcidx,(int)zns->cache.write_cache[wcidx].used);
+     }
+     return maxlat;
+ }
+ 
++void zns_reset(struct zns_ssd *zns, uint32_t zid, uint64_t slba, uint64_t elba)
++{
++    struct zns_blk *blk;
++    femu_log("start zns reset.......\n");
++    int q;
++    for(q = 0;q < zns->cache.num_wc;q++)
++    {
++        if(zns->cache.write_cache[q].sblk==zid)
++        {
++            zns->cache.write_cache[q].used = 0;
++            break;
++        }
++    }
++
++    if(zns->pz[zid].is_ter){
++        for (int i = 0; i < zns->num_ch; i++)
++        {
++            for (int  j = 0; j < zns->num_lun; j++)
++            {
++                for (int k = 0; k < zns->num_plane; k++)
++                {
++                    int blk_number = zns->pz[zid].zb[num(zns,i,j,k)].number;
++                    blk = &(zns->ch[i].fc[j].plane[k].blk[blk_number]);
++
++                    // struct ppa ppa;
++                    // ppa.g.ch = i;
++                    // ppa.g.fc = j;
++                    // ppa.g.pl = k;
++                    // ppa.g.blk = blk_number;
++
++
++                    // struct nand_cmd erase;
++                    // erase.cmd = NAND_ERASE;
++                    // erase.stime = 0;
++                    // zns_advance_status(zns,&ppa,&erase);
++
++
++                    blk->page_wp = 0;
++                    blk->is_use = false;
++                    blk->read_count = 0;
++                    blk->refresh_pending = false;
++                    blk->lpn_wp = 0;
++                    blk->det_zone = -1;
++
++
++                }
++                
++            }
++
++        }
++        zns->pz[zid].is_ter = false;
++        zns->pz[zid].migration_intensity = 0;
++        return ;
++    }
++    return;
++}
++
+ static void *ftl_thread(void *arg)
+ {
+     FemuCtrl *n = (FemuCtrl *)arg;
+@@ -363,6 +1058,10 @@ static void *ftl_thread(void *arg)
+                 ftl_err("FTL to_poller enqueue failed\n");
+             }
+ 
++            // if (zns->read_refresh_enabled && zns->refresh_queue.pending_count > 0) {
++            //     zns_process_refresh_requests(zns);
++            // }
++
+         }
+     }
+ 
+diff --git a/hw/femu/zns/zftl.h b/hw/femu/zns/zftl.h
+index f7521ba3..328ebe59 100644
+--- a/hw/femu/zns/zftl.h
++++ b/hw/femu/zns/zftl.h
+@@ -2,12 +2,16 @@
+ #define __FEMU_ZFTL_H
+ 
+ #include "../nvme.h"
++#include <math.h>
+ 
+ #define INVALID_PPA     (~(0ULL))
+ #define INVALID_LPN     (~(0ULL))
+ #define UNMAPPED_PPA    (~(0ULL))
+ 
++static uint32_t RR_start_count = 0;
++
+ void zftl_init(FemuCtrl *n);
++void zns_reset(struct zns_ssd *zns, uint32_t zid, uint64_t slba, uint64_t elba);
+ 
+ #ifdef FEMU_DEBUG_ZFTL
+ #define ftl_debug(fmt, ...) \
+diff --git a/hw/femu/zns/zns.c b/hw/femu/zns/zns.c
+index 396b71bd..e25eda78 100644
+--- a/hw/femu/zns/zns.c
++++ b/hw/femu/zns/zns.c
+@@ -26,18 +26,20 @@ static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
+     uint64_t zone_size, zone_cap;
+     uint32_t lbasz = 1 << zns_ns_lbads(ns);
+ 
++    femu_log("lba size is %d\n",lbasz);
++
+     if (n->zone_size_bs) {
+         zone_size = n->zone_size_bs;
+     } else {
+         zone_size = NVME_DEFAULT_ZONE_SIZE;
+     }
+-
++    femu_log("zone size is %d\n",zone_size);
+     if (n->zone_cap_bs) {
+         zone_cap = n->zone_cap_bs;
+     } else {
+         zone_cap = zone_size;
+     }
+-
++    femu_log("zone cap is %d\n",zone_cap);
+     if (zone_cap > zone_size) {
+         femu_err("zone capacity %luB > zone size %luB", zone_cap, zone_size);
+         return -1;
+@@ -52,8 +54,13 @@ static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
+     }
+ 
+     n->zone_size = zone_size / lbasz;
++    femu_log("n->zone_size is %d\n",n->zone_size);
++
+     n->zone_capacity = zone_cap / lbasz;
++    femu_log("n->zone_capacity is %d\n",n->zone_capacity);
++
+     n->num_zones = ns->size / lbasz / n->zone_size;
++    femu_log("n->num_zones is %d\n",n->num_zones);
+ 
+     if (n->max_open_zones > n->num_zones) {
+         femu_err("max_open_zones value %u exceeds the number of zones %u",
+@@ -523,7 +530,7 @@ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
+     default:
+         break;
+     }
+-
++    zns_reset(ns->ctrl->zns, zns_zone_idx(ns, zone->d.zslba), zone->d.zslba, zns_zone_rd_boundary(ns,zone));
+ #if 0
+     FemuCtrl *n = ns->ctrl;
+     int ch, lun;
+@@ -643,6 +650,8 @@ static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
+         return NVME_ZONE_INVAL_TRANSITION;
+     }
+ 
++
++    femu_log("reset zone --------\n");
+     zns_aio_zone_reset_cb(req, zone);
+ 
+     return NVME_SUCCESS;
+@@ -1204,37 +1213,49 @@ static void zns_set_ctrl(FemuCtrl *n)
+ 
+ // Add zns init ch, zns init flash and zns init block
+ // ----------------------------
+-static void zns_init_blk(struct zns_blk *blk,int num_blk,int blkidx,int flash_type)
++static void zns_init_blk(struct zns_ssd *zns, struct zns_blk *blk,int num_blk,int blkidx,int flash_type)
+ {
+     blk->nand_type = flash_type;
+     blk->next_blk_avail_time = 0;
+     blk->page_wp = 0;
++    blk->is_use = false;
++    blk->read_count = 0;
++    blk->refresh_pending = false;
++    blk->lpn_list = g_malloc0(sizeof(struct lpn_type) * (zns->num_page * zns->flash_type * (ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE) ));
++    for (int i = 0; i < zns->num_page * zns->flash_type * (ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE) ; i++)
++    {
++        blk->lpn_list[i].lpn = INVALID_LPN;
++    }
++    blk->lpn_wp = 0;
++    blk->det_zone = -1;
++    blk->is_migration = 0;
++
+ }
+ 
+-static void zns_init_plane(struct zns_plane *plane,int num_blk,int flash_type)
++static void zns_init_plane(struct zns_ssd *zns, struct zns_plane *plane,int num_blk,int flash_type)
+ {
+     plane->blk = g_malloc0(sizeof(struct zns_blk) * num_blk);
+     for (int i = 0; i < num_blk; i++) {
+-        zns_init_blk(&plane->blk[i],num_blk,i,flash_type);
++        zns_init_blk(zns,&plane->blk[i],num_blk,i,flash_type);
+     }
+     plane->next_plane_avail_time = 0;
+ }
+ 
+-static void zns_init_fc(struct zns_fc *fc,uint8_t num_plane,uint8_t num_blk,int flash_type)
++static void zns_init_fc(struct zns_ssd *zns, struct zns_fc *fc,uint8_t num_plane,uint8_t num_blk,int flash_type)
+ {
+     fc->plane = g_malloc0(sizeof(struct zns_plane) * num_plane);
+     for(int i = 0;i < num_plane;i++)
+     {
+-        zns_init_plane(&fc->plane[i],num_blk,flash_type);
++        zns_init_plane(zns,&fc->plane[i],num_blk,flash_type);
+     }
+     fc->next_fc_avail_time = 0;
+ }
+ 
+-static void zns_init_ch(struct zns_ch *ch, uint8_t num_lun,uint8_t num_plane, uint8_t num_blk,int flash_type)
++static void zns_init_ch(struct zns_ssd *zns, struct zns_ch *ch, uint8_t num_lun,uint8_t num_plane, uint8_t num_blk,int flash_type)
+ {
+     ch->fc = g_malloc0(sizeof(struct zns_fc) * num_lun);
+     for (int i = 0; i < num_lun; i++) {
+-        zns_init_fc(&ch->fc[i],num_plane,num_blk,flash_type);
++        zns_init_fc(zns,&ch->fc[i],num_plane,num_blk,flash_type);
+     }
+     ch->next_ch_avail_time = 0;
+ }
+@@ -1244,22 +1265,66 @@ static void zns_init_params(FemuCtrl *n)
+     struct zns_ssd *id_zns;
+     int i;
+ 
++
++    femu_log("start========================================\n");
++
+     id_zns = g_malloc0(sizeof(struct zns_ssd));
+     id_zns->num_ch = n->zns_params.zns_num_ch;
+     id_zns->num_lun = n->zns_params.zns_num_lun;
+     id_zns->num_plane = n->zns_params.zns_num_plane;
+     id_zns->num_blk = n->zns_params.zns_num_blk;
+-    id_zns->num_page = n->ns_size/ZNS_PAGE_SIZE/(id_zns->num_ch*id_zns->num_lun*id_zns->num_blk);
++
++    id_zns->read_refresh_enabled = n->zns_params.read_refresh_enabled;
++    id_zns->read_refresh_threshold = n->zns_params.read_refresh_threshold;
++    id_zns->migration = n->zns_params.migration;
++
++    // id_zns->read_refresh_enabled = true;
++    // id_zns->read_refresh_threshold = 1000;
++
++    /* Initialize read refresh queue */
++    QTAILQ_INIT(&id_zns->refresh_queue.pending_reqs);
++    id_zns->refresh_queue.pending_count = 0;
++    id_zns->refresh_queue.max_pending = 100;  /* Max 100 pending refresh requests */
++
++    id_zns->num_page = n->ns_size/ZNS_PAGE_SIZE/(id_zns->num_ch*id_zns->num_lun*id_zns->num_plane*id_zns->num_blk);
+     id_zns->lbasz = 1 << zns_ns_lbads(&n->namespaces[0]);
+     id_zns->flash_type = n->zns_params.zns_flash_type;
+ 
+     id_zns->ch = g_malloc0(sizeof(struct zns_ch) * id_zns->num_ch);
+     for (i =0; i < id_zns->num_ch; i++) {
+-        zns_init_ch(&id_zns->ch[i], id_zns->num_lun,id_zns->num_plane,id_zns->num_blk,id_zns->flash_type);
++        zns_init_ch(id_zns,&id_zns->ch[i], id_zns->num_lun,id_zns->num_plane,id_zns->num_blk,id_zns->flash_type);
+     }
+ 
+-    id_zns->wp.ch = 0;
+-    id_zns->wp.lun = 0;
++    id_zns->pz = g_malloc0(sizeof(struct physical_zone) * id_zns->num_blk);
++
++    id_zns->wp = g_malloc0(sizeof(struct write_pointer) * id_zns->num_blk);
++
++    for (int j = 0; j < id_zns->num_blk; j++)
++    {
++        id_zns->pz[j].zb = g_malloc0(sizeof(struct zone_block) * (id_zns->num_ch * id_zns->num_lun * id_zns->num_plane));
++        for (int k = 0; k < (id_zns->num_ch * id_zns->num_lun * id_zns->num_plane); k++)
++        {
++            id_zns->pz[j].zb[k].number = j;
++            // id_zns->pz[i].zb[j].is_use = false;
++        }
++        id_zns->pz[j].is_ter = false;
++        id_zns->pz[j].is_do_RR = false;
++        id_zns->pz[j].migration_intensity = 0;
++
++
++
++        id_zns->wp[j].ch = 0;
++        id_zns->wp[j].lun = 0;
++        id_zns->wp[j].pl = 0;
++
++    }
++    
++
++
++    
++
++    // id_zns->wp.ch = 0;
++    // id_zns->wp.lun = 0;
+ 
+     //Misao: init mapping table
+     id_zns->l2p_sz = n->ns_size/LOGICAL_PAGE_SIZE;
+@@ -1269,7 +1334,7 @@ static void zns_init_params(FemuCtrl *n)
+     }
+ 
+     //Misao: init sram
+-    id_zns->program_unit = ZNS_PAGE_SIZE*id_zns->flash_type*2; //PAGE_SIZE*flash_type*2 planes
++    id_zns->program_unit = ZNS_PAGE_SIZE*id_zns->flash_type*id_zns->num_plane; //PAGE_SIZE*flash_type*2 planes
+     id_zns->stripe_unit = id_zns->program_unit*id_zns->num_ch*id_zns->num_lun;
+     id_zns->cache.num_wc = ZNS_DEFAULT_NUM_WRITE_CACHE;
+     id_zns->cache.write_cache = g_malloc0(sizeof(struct zns_write_cache) * id_zns->cache.num_wc);
+@@ -1287,6 +1352,14 @@ static void zns_init_params(FemuCtrl *n)
+     femu_log("|\tnchnl\t: %lu\t|\tchips per chnl\t: %lu\t|\tplanes per chip\t: %lu\t|\tblks per plane\t: %lu\t|\tpages per blk\t: %lu\t|\n",id_zns->num_ch,id_zns->num_lun,id_zns->num_plane,id_zns->num_blk,id_zns->num_page);
+     //femu_log("|\tl2p sz\t: %lu\t|\tl2p cache sz\t: %u\t|\n",id_zns->l2p_sz,id_zns->cache.num_l2p_ent);
+     femu_log("|\tprogram unit\t: %lu KiB\t|\tstripe unit\t: %lu KiB\t|\t# of write caches\t: %u\t|\t size of write caches (4KiB)\t: %lu\t|\n",id_zns->program_unit/(KiB),id_zns->stripe_unit/(KiB),id_zns->cache.num_wc,(id_zns->stripe_unit/LOGICAL_PAGE_SIZE));
++
++    femu_log("zns read refresh is  %d\n",id_zns->read_refresh_enabled);
++    femu_log("zns read refresh threshold is  %d\n",id_zns->read_refresh_threshold);
++    femu_log("zns migration is  %d\n",id_zns->migration);
++    femu_log("zns n-poller is  %d\n",n->nr_pollers);
++
++
++
+     femu_log("===========================================\n"); 
+ 
+     //Misao: use average read latency
+diff --git a/hw/femu/zns/zns.h b/hw/femu/zns/zns.h
+index b3a5a45f..4260de9d 100644
+--- a/hw/femu/zns/zns.h
++++ b/hw/femu/zns/zns.h
+@@ -6,7 +6,7 @@
+ #define BLK_BITS    (32)
+ #define PL_BITS     (1)
+ #define FC_BITS     (2)
+-#define CH_BITS     (1)
++#define CH_BITS     (3)
+ 
+ #include "../nvme.h"
+ #include "zftl.h"
+@@ -32,11 +32,11 @@
+  */
+ #define SLC_PROGRAM_LATENCY_NS (75000)
+ #define TLC_PROGRAM_LATENCY_NS (937500)
+-#define QLC_PROGRAM_LATENCY_NS (12196000)
++#define QLC_PROGRAM_LATENCY_NS (800000)
+ 
+ #define SLC_READ_LATENCY_NS (4000)
+ #define TLC_READ_LATENCY_NS (32000)
+-#define QLC_READ_LATENCY_NS (85000)
++#define QLC_READ_LATENCY_NS (40000)
+ 
+ /**
+  * just to emulate very small read/write latency
+@@ -74,7 +74,7 @@ struct ppa {
+         uint64_t pl   : PL_BITS;
+ 	    uint64_t ch   : CH_BITS;
+         uint64_t V    : 1;
+-        uint64_t rsv  : 8;
++        uint64_t rsv  : 6;
+         } g;
+ 
+ 	uint64_t ppa;
+@@ -84,6 +84,7 @@ struct ppa {
+ struct write_pointer {
+     uint64_t ch;
+     uint64_t lun;
++    uint64_t pl;
+ };
+ 
+ struct nand_cmd {
+@@ -93,10 +94,21 @@ struct nand_cmd {
+ };
+ 
+ 
++struct lpn_type{
++    uint64_t lpn;
++};
++
+ struct zns_blk {
+     int nand_type;
+     uint64_t next_blk_avail_time;
+     uint64_t page_wp; //next free page
++    bool is_use;
++    uint32_t read_count;
++    bool refresh_pending;     /* Read refresh: whether refresh is pending */
++    struct lpn_type *lpn_list;
++    uint64_t lpn_wp;
++    int det_zone;
++    bool is_migration;
+ };
+ 
+ struct zns_plane{
+@@ -133,6 +145,40 @@ struct zns_sram{
+     struct zns_write_cache* write_cache;
+ };
+ 
++struct zns_refresh_req
++{
++    struct ppa old_ppa;
++    struct ppa new_ppa;
++    uint64_t lpn;
++    // uint32_t block_idx;
++    uint64_t stime;
++    bool is_full_block_refresh;
++
++    QTAILQ_ENTRY(zns_refresh_req) entry;
++    // QTAILQ_EMPTY(zns_refresh_req) entry;
++};
++
++struct zns_refresh_queue {
++    QTAILQ_HEAD(, zns_refresh_req) pending_reqs;
++    int pending_count;
++    int max_pending;
++};
++
++struct zone_block {
++    int number;
++    // bool is_use;
++};
++
++struct physical_zone
++{
++    struct zone_block *zb;
++    bool is_ter;
++    bool is_do_RR;
++    int migration_intensity;
++};
++
++
++
+ struct zns_ssd {
+     uint64_t num_ch;
+     uint64_t num_lun;
+@@ -141,7 +187,9 @@ struct zns_ssd {
+     uint64_t num_page;
+ 
+     struct zns_ch *ch;
+-    struct write_pointer wp;
++    struct write_pointer *wp;
++
++    struct physical_zone *pz;
+ 
+     SSDNandFlashTiming timing; /*Misao: accurate  timing emulation for zns ssd.*/
+     int flash_type;
+@@ -161,6 +209,12 @@ struct zns_ssd {
+ 
+     uint32_t lbasz;
+     uint32_t active_zone;
++
++    /* Read refresh management */
++    struct zns_refresh_queue refresh_queue;
++    bool read_refresh_enabled;
++    uint32_t read_refresh_threshold;
++    uint32_t migration;
+ };
+ 
+ enum NvmeZoneAttr {
+-- 
+2.34.1
+
